@@ -1,0 +1,50 @@
+# clatto configuration. Every key here can also be set from the environment;
+# see README.md for the CLATTO_* variables.
+
+interface:
+  name: clat0          # tun device name
+  mtu: 1500
+  # configure: true    # bring the link up, add addresses/routes, set sysctls
+  # auto_routes: true  # route every mapped prefix via the interface
+  # sysctl: true       # enable net.ipv4.ip_forward and net.ipv6.conf.all.forwarding
+  # addresses: []      # extra addresses to assign to the interface
+  # routes: []         # extra routes via the interface
+
+# The translator's own addresses. It answers pings on them and sources ICMP
+# errors from them. ipv6_address is derived from ipv4_address and the prefix
+# when omitted.
+ipv4_address: 192.168.255.1
+# ipv6_address: 2001:db8:1::2
+
+# NAT64 prefix (RFC 6052; /32, /40, /48, /56, /64 or /96).
+prefix: 2001:db8:1:ffff::/96
+# prefix: 64:ff9b::/96
+# wkpf_strict: true   # forbid private IPv4 through 64:ff9b::/96 (RFC 6052)
+
+# Static maps. Prefixes on both sides must be the same size.
+maps:
+  - ipv4: 192.168.5.42
+    ipv6: 2001:db8:1:4444::1
+  # - ipv4: 10.1.0.0/24
+  #   ipv6: 2001:db8:1:5555::/120
+
+# IPv6 hosts without a static map get an IPv4 address from this pool.
+dynamic_pool:
+  prefix: 192.168.255.0/24
+  # state_file: /var/lib/clatto/dynamic.map   # persist assignments across restarts
+  # min_lease: 2h4m
+  # max_lease: 336h
+
+# UDP datagrams without a checksum: drop (RFC 7915), calc, or forward.
+udp_checksum: drop
+
+# IPv4 packets without DF larger than this are fragmented on the IPv6 side.
+offlink_mtu: 1280
+
+log:
+  level: info          # debug, info, warn, error
+  format: json         # json, text
+  # packets: [drop, reject, icmp, self, dynamic]   # log packet events (also counted in metrics)
+
+http:
+  listen: ":6464"      # /healthz /readyz /metrics /config; "off" disables

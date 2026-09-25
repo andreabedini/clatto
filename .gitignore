@@ -1,0 +1,8 @@
+# upstream C sources kept for reference only
+/clatto
+/dist/
+*.test
+*.out
+/testdata/fuzz/*/
+.claude/settings.local.json
+.claude/.cc-writes/

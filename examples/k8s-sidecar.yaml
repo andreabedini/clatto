@@ -1,0 +1,68 @@
+# Example: NAT64 sidecar giving an IPv6-only pod a path to IPv4 destinations.
+#
+# The pod's own IPv6 address is mapped statically to the pod's IPv4 address
+# (dual-stack cluster) so replies find their way back; the NAT64 prefix is
+# routed through the sidecar's tun device inside the pod network namespace.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clatto
+data:
+  config.yaml: |
+    ipv4_address: 192.168.255.1
+    prefix: 64:ff9b::/96
+    wkpf_strict: false
+    dynamic_pool:
+      prefix: 192.168.255.0/24
+    log:
+      packets: [reject, dynamic]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-with-nat64
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: app-with-nat64}
+  template:
+    metadata:
+      labels: {app: app-with-nat64}
+    spec:
+      containers:
+        - name: app
+          image: docker.io/library/busybox:1.36
+          command: ["sh", "-c", "sleep infinity"]
+        - name: clatto
+          image: ghcr.io/andreabedini/clatto:latest
+          args: ["-config", "/etc/clatto/config.yaml"]
+          env:
+            # Any key can be overridden here, e.g.
+            # - {name: CLATTO_LOG_LEVEL, value: debug}
+            - {name: CLATTO_HTTP_LISTEN, value: ":6464"}
+          ports:
+            - {name: admin, containerPort: 6464}
+          livenessProbe:
+            httpGet: {path: /healthz, port: admin}
+          readinessProbe:
+            httpGet: {path: /readyz, port: admin}
+          securityContext:
+            capabilities:
+              drop: [ALL]
+              add: [NET_ADMIN]
+          volumeMounts:
+            - {name: config, mountPath: /etc/clatto, readOnly: true}
+            - {name: tun, mountPath: /dev/net/tun}
+      # Forwarding must be enabled in the pod network namespace. clatto sets
+      # it via /proc/sys when that is writable; otherwise set it here
+      # (requires the kubelet to allow these unsafe sysctls) and set
+      # CLATTO_INTERFACE_SYSCTL=false.
+      # securityContext:
+      #   sysctls:
+      #     - {name: net.ipv4.ip_forward, value: "1"}
+      #     - {name: net.ipv6.conf.all.forwarding, value: "1"}
+      volumes:
+        - name: config
+          configMap: {name: clatto}
+        - name: tun
+          hostPath: {path: /dev/net/tun, type: CharDevice}
