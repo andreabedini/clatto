@@ -202,10 +202,20 @@ func TestWatchFileReloads(t *testing.T) {
 	go d.Run(ctx)
 	go d.WatchFile(ctx, path, 10*time.Millisecond)
 
-	time.Sleep(30 * time.Millisecond) // let the watcher take its baseline
-	if err := os.WriteFile(path, []byte(strings.Replace(baseYAML, "2001:db8::10", "2001:db8::12", 1)), 0o644); err != nil {
-		t.Fatal(err)
+	// Replace the file atomically, as a ConfigMap volume does; writing in
+	// place lets the watcher read a truncated document.
+	replace := func(data string) {
+		t.Helper()
+		tmp := path + ".tmp"
+		if err := os.WriteFile(tmp, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			t.Fatal(err)
+		}
 	}
+	time.Sleep(30 * time.Millisecond) // let the watcher take its baseline
+	replace(strings.Replace(baseYAML, "2001:db8::10", "2001:db8::12", 1))
 	deadline := time.Now().Add(2 * time.Second)
 	for d.Status().Generation < 2 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
@@ -219,7 +229,7 @@ func TestWatchFileReloads(t *testing.T) {
 		t.Fatalf("config not updated: %s", data)
 	}
 	// A broken file is rejected and the good config stays.
-	os.WriteFile(path, []byte("ipv4_address: nope\n"), 0o644)
+	replace("ipv4_address: nope\n")
 	deadline = time.Now().Add(2 * time.Second)
 	for d.Status().LastError == "" && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
