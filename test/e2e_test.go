@@ -381,7 +381,8 @@ func TestUDPFromIPv4(t *testing.T) {
 	}
 	ip(t, "link", "set", "lo", "up")
 	for _, a := range []string{"10.0.0.1/32", "2001:db8::1/128"} {
-		if out, err := exec.Command("ip", "addr", "add", a, "dev", "lo").CombinedOutput(); err != nil && !strings.Contains(string(out), "File exists") {
+		// Earlier tests may have added the address already.
+		if out, err := exec.Command("ip", "addr", "add", a, "dev", "lo").CombinedOutput(); err != nil && !strings.Contains(string(out), "File exists") && !strings.Contains(string(out), "already assigned") {
 			t.Fatalf("ip addr add %s: %v: %s", a, err, out)
 		}
 	}
