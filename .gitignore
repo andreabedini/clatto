@@ -7,3 +7,4 @@
 .claude/settings.local.json
 .claude/.cc-writes/
 e2e.log
+bench.log

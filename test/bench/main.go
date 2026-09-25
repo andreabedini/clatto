@@ -88,25 +88,34 @@ func main() {
 	}
 }
 
-// cpuSeconds returns the CPU time the process has consumed, from
-// /proc/<pid>/schedstat, or 0 when pid is 0.
+// cpuSeconds returns the CPU time the process has consumed, summed over
+// its threads from /proc/<pid>/task/*/schedstat (the process's own
+// schedstat covers the main thread only), or 0 when pid is 0.
 func cpuSeconds(pid int) (float64, error) {
 	if pid == 0 {
 		return 0, nil
 	}
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/schedstat", pid))
+	tasks, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
 	if err != nil {
 		return 0, err
 	}
-	fields := strings.Fields(string(data))
-	if len(fields) < 1 {
-		return 0, fmt.Errorf("unexpected schedstat %q", data)
+	var total float64
+	for _, t := range tasks {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%s/schedstat", pid, t.Name()))
+		if err != nil {
+			continue // the thread exited meanwhile
+		}
+		fields := strings.Fields(string(data))
+		if len(fields) < 1 {
+			return 0, fmt.Errorf("unexpected schedstat %q", data)
+		}
+		ns, err := strconv.ParseFloat(fields[0], 64)
+		if err != nil {
+			return 0, err
+		}
+		total += ns
 	}
-	ns, err := strconv.ParseFloat(fields[0], 64)
-	if err != nil {
-		return 0, err
-	}
-	return ns / 1e9, nil
+	return total / 1e9, nil
 }
 
 func runUDP(client, server, target string, port, size, flows int, d time.Duration, pid int) (Result, error) {

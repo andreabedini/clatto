@@ -6,6 +6,7 @@
 #
 #   test/bench.sh [path/to/tayga]        # tayga defaults to $TAYGA or $PATH
 #   DURATION=10 FLOWS="1 4" test/bench.sh
+#   PROFILE=/tmp/clatto.pprof test/bench.sh   # also record clatto's CPU profile
 #
 # Needs /dev/net/tun and either root or unprivileged user namespaces, like
 # test/e2e.sh. Without a tayga binary only clatto is measured.
@@ -14,7 +15,7 @@ cd "$(dirname "$0")/.."
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/clatto-bench.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 TAYGA="${1:-${TAYGA:-$(command -v tayga || true)}}"
-export TAYGA DURATION="${DURATION:-5}" FLOWS="${FLOWS:-1 4}" SIZES="${SIZES:-64 512 1400}"
+export TAYGA DURATION="${DURATION:-5}" FLOWS="${FLOWS:-1 4}" SIZES="${SIZES:-64 512 1400}" PROFILE="${PROFILE:-}"
 
 go build -o "$tmp/clatto" ./cmd/clatto
 go build -o "$tmp/bench" ./test/bench
@@ -68,12 +69,13 @@ measure() {
 }
 
 echo "== clatto ($("$tmp/clatto" -version))"
-"$tmp/clatto" -config "$tmp/clatto.yaml" -no-watch &
+"$tmp/clatto" -config "$tmp/clatto.yaml" -no-watch ${PROFILE:+-cpuprofile "$PROFILE"} >/dev/null &
 pid=$!
 wait_for_link
 measure clatto "$pid"
 kill "$pid"
 wait "$pid" 2>/dev/null || true
+[ -z "$PROFILE" ] || echo "clatto CPU profile: $PROFILE (go tool pprof -top $PROFILE)"
 
 if [ -n "$TAYGA" ]; then
 	echo "== tayga ($TAYGA)"

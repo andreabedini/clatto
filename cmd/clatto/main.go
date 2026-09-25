@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/pprof"
 	"strings"
 	"syscall"
 	"time"
@@ -48,6 +49,7 @@ func run() int {
 		showVersion = flag.Bool("version", false, "print the version and exit")
 		noWatch     = flag.Bool("no-watch", false, "do not reload when the configuration file changes")
 		probe       = flag.String("probe", "", "request this path (e.g. /readyz) from the admin listener of the configured instance and exit 0 on success; for exec probes")
+		cpuProfile  = flag.String("cpuprofile", "", "write a CPU profile to this file until exit (for test/bench.sh)")
 	)
 	flag.Parse()
 	if *showVersion {
@@ -119,6 +121,22 @@ func run() int {
 	log := slog.New(handler)
 	slog.SetDefault(log)
 	log.Info("starting clatto", "version", version, "config", *configPath)
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			log.Error("cpuprofile", "error", err)
+			return 1
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Error("cpuprofile", "error", err)
+			return 1
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			f.Close()
+			log.Info("cpu profile written", "path", *cpuProfile)
+		}()
+	}
 	for _, w := range resolved.Warnings {
 		log.Warn(w)
 	}
