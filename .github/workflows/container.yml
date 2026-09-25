@@ -11,9 +11,6 @@ permissions:
   contents: read
   packages: write
 
-env:
-  KO_DOCKER_REPO: ghcr.io/${{ github.repository }}
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -24,14 +21,15 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Logs in to ghcr.io with GITHUB_TOKEN on its own.
+      # Sets KO_DOCKER_REPO=ghcr.io/<owner>/<repo> and logs in to ghcr.io
+      # with GITHUB_TOKEN; it skips both when KO_DOCKER_REPO is preset.
       - uses: ko-build/setup-ko@v0.10
 
       - name: Compute image tags
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.KO_DOCKER_REPO }}
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
