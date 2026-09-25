@@ -83,8 +83,10 @@ func TestReloadUpdatesRoutes(t *testing.T) {
 	if strings.Contains(v4, "10.0.0.2 ") || !strings.Contains(v4, "10.0.0.3 ") || !strings.Contains(v4, "10.0.1.0/24") {
 		t.Errorf("IPv4 routes not updated:\n%s", v4)
 	}
-	if strings.Contains(v6, "2001:db8::1 ") || !strings.Contains(v6, "2001:db8::3 ") || !strings.Contains(v6, "2001:db8:1::/120") {
-		t.Errorf("IPv6 routes not updated:\n%s", v6)
+	// The IPv6 side of a static map is never routed into the device: it
+	// is a real host, and a route would loop translated packets back.
+	if strings.Contains(v6, "2001:db8::1 ") || strings.Contains(v6, "2001:db8::3 ") || strings.Contains(v6, "2001:db8:1::/120") || !strings.Contains(v6, "64:ff9b::/96") || !strings.Contains(v6, "2001:db8::fe ") {
+		t.Errorf("IPv6 routes wrong:\n%s", v6)
 	}
 	cancel()
 	if err := <-done; err != nil {
@@ -363,6 +365,97 @@ clat: {ipv6_address: auto}
 	}
 	echo("other port", false)
 
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestUDPFromIPv4 sends the other way: an IPv4 client on 10.0.0.1 reaches
+// the IPv6 host 2001:db8::1 through its static map 10.0.0.2. The map's
+// IPv6 side is a local address here, as a real host would be reachable
+// through the network; only the IPv4 side is routed into the device.
+func TestUDPFromIPv4(t *testing.T) {
+	if _, err := os.Stat("/dev/net/tun"); err != nil {
+		t.Skip("/dev/net/tun not available")
+	}
+	ip(t, "link", "set", "lo", "up")
+	for _, a := range []string{"10.0.0.1/32", "2001:db8::1/128"} {
+		if out, err := exec.Command("ip", "addr", "add", a, "dev", "lo").CombinedOutput(); err != nil && !strings.Contains(string(out), "File exists") {
+			t.Fatalf("ip addr add %s: %v: %s", a, err, out)
+		}
+	}
+	var cfg config.Config
+	if err := config.LoadYAML(&cfg, []byte(`
+interface: {name: clat-e2e4, sysctl: false}
+ipv4_address: 10.0.0.254
+ipv6_address: 2001:db8::fe
+prefix: 64:ff9b::/96
+wkpf_strict: false
+log: {packets: [drop, reject, icmp]}
+maps:
+  - {ipv4: 10.0.0.2, ipv6: 2001:db8::1}
+`)); err != nil {
+		t.Fatal(err)
+	}
+	r, err := config.Resolve(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := daemon.New(r, daemon.Options{Log: slog.Default(), Registry: prometheus.NewRegistry()})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	for !d.Ready() {
+		select {
+		case err := <-done:
+			t.Fatalf("daemon: %v", err)
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if v6 := routes(t, "-6", "clat-e2e4"); strings.Contains(v6, "2001:db8::1 ") {
+		t.Fatalf("static map's IPv6 side routed into the device:\n%s", v6)
+	}
+
+	server, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.ParseIP("2001:db8::1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	port := server.LocalAddr().(*net.UDPAddr).Port
+	go func() {
+		buf := make([]byte, 2000)
+		for {
+			n, from, err := server.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if from.IP.String() != "64:ff9b::a00:1" {
+				t.Errorf("server saw source %s, want 64:ff9b::10.0.0.1", from.IP)
+			}
+			server.WriteToUDP(buf[:n], from)
+		}
+	}()
+	client, err := net.DialUDP("udp4", &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1)}, &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: port})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	msg := []byte("hello from IPv4")
+	if _, err := client.Write(msg); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 2000)
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := client.Read(buf)
+	if err != nil {
+		t.Fatalf("no echo: %v (stats %+v)", err, d.Engine().Stats())
+	}
+	if string(buf[:n]) != string(msg) {
+		t.Fatalf("echo mismatch")
+	}
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatal(err)

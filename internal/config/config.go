@@ -156,8 +156,11 @@ type Interface struct {
 	// Routes are installed via the interface in addition to the automatic
 	// ones; a route here replaces the automatic route for the same prefix.
 	Routes []Route `yaml:"routes,omitempty"`
-	// AutoRoutes installs routes for every mapped prefix (in CLAT mode: an
-	// IPv4 default route). Default true.
+	// AutoRoutes routes what the translator receives via the interface:
+	// the static maps' IPv4 side, the dynamic pool, its own addresses and
+	// the prefix (in CLAT mode: an IPv4 default route instead of the
+	// prefix). The IPv6 side of a static map is a real host and is not
+	// routed. Default true.
 	AutoRoutes *bool `yaml:"auto_routes,omitempty"`
 	// Sysctl enables IPv4 and IPv6 forwarding (in CLAT mode: IPv6 only).
 	// Default true.
@@ -867,7 +870,10 @@ func ResolveWith(cfg Config, ro ResolveOptions) (*Resolved, error) {
 					continue // both sides are local addresses
 				}
 				auto = append(auto, netconf.Route{Prefix: e.V4})
-				if !cfg.Prefix.IsValid() || !cfg.Prefix.Contains(e.V6.Addr()) {
+				// The IPv6 side of a static map is a real host the
+				// translator sends to, never routed here; only its own
+				// address is received through the interface.
+				if e.V4 == netip.PrefixFrom(cfg.IPv4Address, 32) && !v6Derived {
 					auto = append(auto, netconf.Route{Prefix: e.V6})
 				}
 			case addrmap.KindRFC6052:

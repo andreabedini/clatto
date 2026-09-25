@@ -1,16 +1,15 @@
-# A CLAT (RFC 6877 customer-side translator) for an IPv6-only host.
+# A CLAT (RFC 6877 customer-side translator) with a dedicated IPv6 address.
 #
-# Applications bind to 192.0.0.1 and use the default IPv4 route via clat0.
-# clatto maps 192.0.0.1 to the dedicated IPv6 address 2001:db8::464, which
-# must be routed to this host but not assigned to any interface, and
-# embeds every IPv4 destination in the PLAT prefix.
-ipv4_address: 192.0.0.2
-ipv6_address: 2001:db8::c1a7
+# Applications bind to 192.0.0.1 and use the IPv4 default route via clat0.
+# clatto maps 192.0.0.1 to 2001:db8::464, which the network must route to
+# this host (it is not assigned to any interface), and embeds every IPv4
+# destination in the PLAT prefix. Replies from the prefix to 2001:db8::464
+# are sent into the tun device by the policy rule the clat block installs.
+# For a host with a single address use clat-shared.yaml, which detects it.
 prefix: 64:ff9b::/96
-maps:
-  - ipv4: 192.0.0.1
-    ipv6: 2001:db8::464
+clat:
+  ipv6_address: 2001:db8::464
+  # ipv4_address: 192.0.0.1
+# ipv4_address: 192.0.0.2   # the translator's own address (default in CLAT mode)
 interface:
   name: clat0
-  addresses: [192.0.0.1/32]
-  routes: [0.0.0.0/0]

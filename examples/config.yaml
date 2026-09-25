@@ -5,7 +5,9 @@ interface:
   name: clat0          # tun device name
   mtu: 1500
   # configure: true    # bring the link up, add addresses/routes, set sysctls
-  # auto_routes: true  # route every mapped prefix via the interface
+  # auto_routes: true  # route what the translator receives via the interface: the maps'
+                       # IPv4 side, the pool, its own addresses and the prefix (not the
+                       # maps' IPv6 side, which is a real host)
   # sysctl: true       # enable net.ipv4.ip_forward and net.ipv6.conf.all.forwarding
   # addresses: []      # extra addresses to assign to the interface
   # routes: []         # extra routes via the interface: 10.0.0.0/8 or {prefix: 0.0.0.0/0, metric: 2048, mtu: 1260, advmss: 1220}

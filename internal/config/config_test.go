@@ -59,7 +59,8 @@ func TestLoadYAMLAndResolve(t *testing.T) {
 		t.Errorf("log/http: %+v", r)
 	}
 	want4 := "10.1.0.0/24 192.168.255.0/24 192.168.255.1/32 192.168.5.42/32"
-	want6 := "2001:db8:1:4444::1/128 2001:db8:1:5555::/120 2001:db8:1:ffff::/96"
+	// The IPv6 side of the static maps is not routed: those are real hosts.
+	want6 := "2001:db8:1:ffff::/96"
 	if got := joinPrefixes(r.Routes4); got != want4 {
 		t.Errorf("routes4 %q want %q", got, want4)
 	}
@@ -170,18 +171,12 @@ func TestResolveErrors(t *testing.T) {
 }
 
 func TestClatExample(t *testing.T) {
-	// A CLAT: the host's IPv4 address maps to a dedicated IPv6 address, the
-	// PLAT prefix is the well-known one.
+	// A CLAT with a dedicated address: the clat block with the address
+	// given instead of detected.
 	y := `
-ipv4_address: 192.0.0.2
-ipv6_address: 2001:db8::c1a7
 prefix: 64:ff9b::/96
-maps:
-  - ipv4: 192.0.0.1
-    ipv6: 2001:db8::464
-interface:
-  addresses: [192.0.0.1/32]
-  routes: [0.0.0.0/0]
+clat:
+  ipv6_address: 2001:db8::464
 `
 	var cfg Config
 	if err := LoadYAML(&cfg, []byte(y)); err != nil {
@@ -190,6 +185,18 @@ interface:
 	r, err := Resolve(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got, want := joinPrefixes(r.Routes4), "0.0.0.0/0 192.0.0.2/32"; got != want {
+		t.Errorf("routes4 %q want %q", got, want)
+	}
+	// Neither the prefix nor the CLAT address goes into the device via
+	// the main table: the PLAT is reached over the network and replies
+	// enter through the policy rule.
+	if len(r.Routes6) != 0 {
+		t.Errorf("routes6 %+v want none", r.Routes6)
+	}
+	if r.Shared == nil || r.Shared.Addr != netip.MustParseAddr("2001:db8::464") {
+		t.Errorf("shared %+v", r.Shared)
 	}
 	v6, err := r.Table.MapIPv4ToIPv6(netip.MustParseAddr("192.0.0.1"))
 	if err != nil || v6 != netip.MustParseAddr("2001:db8::464") {
@@ -373,5 +380,37 @@ func TestParseFilter(t *testing.T) {
 		if _, err := ParseFilter(s); err == nil {
 			t.Errorf("%q: expected error", s)
 		}
+	}
+}
+
+// TestAutoRoutesReceiveOnly checks that automatic routes cover only what
+// the translator must receive. Routing the IPv6 side of a static map
+// into the interface sends translated packets straight back into the
+// translator until their hop limit expires.
+func TestAutoRoutesReceiveOnly(t *testing.T) {
+	y := `
+ipv4_address: 172.18.0.3
+ipv6_address: 2001:db8:ffff::3
+prefix: 64:ff9b::/96
+wkpf_strict: false
+maps:
+  - {ipv4: 172.18.0.1, ipv6: 2001:db8:3500::100}
+  - {ipv4: 172.18.0.2, ipv6: 2001:db8:3500::443}
+dynamic_pool: {prefix: 172.18.0.128/25}
+`
+	var cfg Config
+	if err := LoadYAML(&cfg, []byte(y)); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Resolve(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := joinPrefixes(r.Routes4), "172.18.0.1/32 172.18.0.128/25 172.18.0.2/32 172.18.0.3/32"; got != want {
+		t.Errorf("routes4 %q want %q", got, want)
+	}
+	// The prefix and the translator's own explicit address, nothing else.
+	if got, want := joinPrefixes(r.Routes6), "2001:db8:ffff::3/128 64:ff9b::/96"; got != want {
+		t.Errorf("routes6 %q want %q", got, want)
 	}
 }

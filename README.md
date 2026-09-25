@@ -35,7 +35,7 @@ clatto -config /etc/clatto/config.yaml -probe /readyz  # exec probe against the 
 The process needs `CAP_NET_ADMIN` and `/dev/net/tun`. See
 [examples/config.yaml](examples/config.yaml) for every option,
 [examples/clat.yaml](examples/clat.yaml) for a CLAT with a dedicated
-address, [examples/clat-shared.yaml](examples/clat-shared.yaml) for a CLAT
+address, [examples/clat-shared.yaml](examples/clat-shared.yaml) for one
 sharing the host's address, and [examples/k8s-sidecar.yaml](examples/k8s-sidecar.yaml)
 and [examples/k8s-clat-sidecar.yaml](examples/k8s-clat-sidecar.yaml) for
 pods.
@@ -47,7 +47,7 @@ pods.
 | `interface.name` | `CLATTO_INTERFACE` | tun device name (default `clat0`) |
 | `interface.mtu` | `CLATTO_MTU` | MTU (default 1500) |
 | `interface.configure` | `CLATTO_INTERFACE_CONFIGURE` | link up, addresses, routes, sysctls (default true) |
-| `interface.auto_routes` | `CLATTO_INTERFACE_AUTO_ROUTES` | route every mapped prefix via the device (default true) |
+| `interface.auto_routes` | `CLATTO_INTERFACE_AUTO_ROUTES` | route what the translator receives via the device: the maps' IPv4 side, the pool, its own addresses, the prefix; not the maps' IPv6 side, which is a real host (default true) |
 | `interface.sysctl` | `CLATTO_INTERFACE_SYSCTL` | enable IPv4 and IPv6 forwarding (default true; IPv6 only in CLAT mode) |
 | `interface.addresses` | `CLATTO_INTERFACE_ADDRESSES` | addresses to assign to the device |
 | `interface.routes` | `CLATTO_INTERFACE_ROUTES` | extra routes via the device: a prefix, or `{prefix, metric, mtu, advmss}`; one replaces the automatic route for the same prefix |
@@ -58,7 +58,7 @@ pods.
 | `maps` | `CLATTO_MAPS` | static maps; env form `v4=v6,v4/24=v6/120` |
 | `dynamic_pool.prefix` | `CLATTO_DYNAMIC_POOL` | IPv4 pool for unmapped IPv6 hosts |
 | `dynamic_pool.state_file` | `CLATTO_DYNAMIC_POOL_STATE_FILE` | persist pool assignments (`$STATE_DIRECTORY/dynamic.map` under systemd) |
-| `clat` | `CLATTO_CLAT=true` | CLAT sharing the host's IPv6 address, see below |
+| `clat` | `CLATTO_CLAT=true` | CLAT mode, with a dedicated or the host's own IPv6 address, see below |
 | `clat.ipv6_address` | `CLATTO_CLAT_IPV6_ADDRESS` | the shared address, or `auto` (default): the source address towards the prefix |
 | `clat.ipv4_address` | `CLATTO_CLAT_IPV4_ADDRESS` | the host's IPv4 address, assigned to the device (default `192.0.0.1`) |
 | `clat.ports` | `CLATTO_CLAT_PORTS` | translate only replies to these local ports: `tcp/N-M`, `udp/N`, `icmp` (default: everything from the prefix) |
@@ -74,13 +74,15 @@ pods.
 `CLATTO_CONFIG_YAML` can carry a whole document inline. Precedence is
 defaults, file, environment.
 
-## CLAT sharing the host's address
+## CLAT mode
 
-A CLAT normally owns a dedicated IPv6 address that the network routes to
-it ([examples/clat.yaml](examples/clat.yaml)). A host with a single routed
-address, such as a pod on an IPv6-only cluster, has none to spare, so the
-`clat` block makes clatto reuse the host's own address, as tayga's
-`launch-clat.sh` or clatd's shared mode do:
+The `clat` block makes clatto a customer-side translator. Given a
+dedicated IPv6 address that the network routes to the host
+([examples/clat.yaml](examples/clat.yaml)) it uses that; a host with a
+single routed address, such as a pod on an IPv6-only cluster, has none to
+spare, so `auto` reuses the host's own address instead, as tayga's
+`launch-clat.sh` or clatd's shared mode do
+([examples/clat-shared.yaml](examples/clat-shared.yaml)):
 
 ```yaml
 prefix: 64:ff9b::/96
