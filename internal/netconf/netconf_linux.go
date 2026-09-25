@@ -32,17 +32,10 @@ func Update(prev, next Options, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("find interface %s: %w", next.Name, err)
 	}
-	for _, p := range missing(next.Routes4, prev.Routes4) {
-		if err := delRoute(link, p); err != nil {
+	for _, p := range append(missing(next.Routes4, prev.Routes4), missing(next.Routes6, prev.Routes6)...) {
+		if err := delRoute(link, p, log); err != nil {
 			return err
 		}
-		log.Info("route removed", "prefix", p.String(), "interface", next.Name)
-	}
-	for _, p := range missing(next.Routes6, prev.Routes6) {
-		if err := delRoute(link, p); err != nil {
-			return err
-		}
-		log.Info("route removed", "prefix", p.String(), "interface", next.Name)
 	}
 	for _, p := range missing(next.Addresses, prev.Addresses) {
 		if err := netlink.AddrDel(link, &netlink.Addr{IPNet: prefixToIPNet(p)}); err != nil && !errors.Is(err, unix.EADDRNOTAVAIL) {
@@ -73,10 +66,26 @@ func missing(have, want []netip.Prefix) []netip.Prefix {
 	return out
 }
 
-func delRoute(link netlink.Link, p netip.Prefix) error {
-	r := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixToIPNet(p)}
-	if err := netlink.RouteDel(r); err != nil && !errors.Is(err, unix.ESRCH) {
+// routeScope is the scope routes are added with: link for IPv4 (as
+// "ip route add ... dev" does), universe for IPv6. Deletion must use the
+// same scope or the kernel finds no matching route.
+func routeScope(p netip.Prefix) netlink.Scope {
+	if p.Addr().Is4() {
+		return netlink.SCOPE_LINK
+	}
+	return netlink.SCOPE_UNIVERSE
+}
+
+func delRoute(link netlink.Link, p netip.Prefix, log *slog.Logger) error {
+	r := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixToIPNet(p), Scope: routeScope(p)}
+	err := netlink.RouteDel(r)
+	switch {
+	case errors.Is(err, unix.ESRCH):
+		log.Warn("route already gone", "prefix", p.String(), "interface", link.Attrs().Name)
+	case err != nil:
 		return fmt.Errorf("remove route %s via %s: %w", p, link.Attrs().Name, err)
+	default:
+		log.Info("route removed", "prefix", p.String(), "interface", link.Attrs().Name)
 	}
 	return nil
 }
@@ -100,14 +109,8 @@ func Apply(o Options, log *slog.Logger) error {
 		}
 		log.Info("address added", "address", p.String(), "interface", o.Name)
 	}
-	for _, p := range o.Routes4 {
-		if err := addRoute(link, p, netlink.SCOPE_LINK); err != nil {
-			return err
-		}
-		log.Info("route added", "prefix", p.String(), "interface", o.Name)
-	}
-	for _, p := range o.Routes6 {
-		if err := addRoute(link, p, netlink.SCOPE_UNIVERSE); err != nil {
+	for _, p := range append(append([]netip.Prefix{}, o.Routes4...), o.Routes6...) {
+		if err := addRoute(link, p); err != nil {
 			return err
 		}
 		log.Info("route added", "prefix", p.String(), "interface", o.Name)
@@ -123,8 +126,8 @@ func Apply(o Options, log *slog.Logger) error {
 	return nil
 }
 
-func addRoute(link netlink.Link, p netip.Prefix, scope netlink.Scope) error {
-	r := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixToIPNet(p), Scope: scope}
+func addRoute(link netlink.Link, p netip.Prefix) error {
+	r := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixToIPNet(p), Scope: routeScope(p)}
 	if err := netlink.RouteReplace(r); err != nil {
 		return fmt.Errorf("add route %s via %s: %w", p, link.Attrs().Name, err)
 	}
