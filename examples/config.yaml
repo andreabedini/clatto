@@ -47,4 +47,5 @@ log:
   # packets: [drop, reject, icmp, self, dynamic]   # log packet events (also counted in metrics)
 
 http:
-  listen: ":6464"      # /healthz /readyz /metrics /config; "off" disables
+  listen: ":6464"      # /healthz /readyz /metrics /config /config/status /dynamic; "off" disables
+  # admin: true        # allow PUT /config and POST /config/reload; bind to 127.0.0.1 if so

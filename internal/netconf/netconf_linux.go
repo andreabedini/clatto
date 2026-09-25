@@ -24,6 +24,63 @@ type Options struct {
 	Sysctl    bool
 }
 
+// Update moves the interface from the previously applied options prev to
+// next: routes and addresses no longer wanted are removed, new ones added.
+// Sysctls are never reverted.
+func Update(prev, next Options, log *slog.Logger) error {
+	link, err := netlink.LinkByName(next.Name)
+	if err != nil {
+		return fmt.Errorf("find interface %s: %w", next.Name, err)
+	}
+	for _, p := range missing(next.Routes4, prev.Routes4) {
+		if err := delRoute(link, p); err != nil {
+			return err
+		}
+		log.Info("route removed", "prefix", p.String(), "interface", next.Name)
+	}
+	for _, p := range missing(next.Routes6, prev.Routes6) {
+		if err := delRoute(link, p); err != nil {
+			return err
+		}
+		log.Info("route removed", "prefix", p.String(), "interface", next.Name)
+	}
+	for _, p := range missing(next.Addresses, prev.Addresses) {
+		if err := netlink.AddrDel(link, &netlink.Addr{IPNet: prefixToIPNet(p)}); err != nil && !errors.Is(err, unix.EADDRNOTAVAIL) {
+			return fmt.Errorf("remove address %s from %s: %w", p, next.Name, err)
+		}
+		log.Info("address removed", "address", p.String(), "interface", next.Name)
+	}
+	added := next
+	added.Addresses = missing(prev.Addresses, next.Addresses)
+	added.Routes4 = missing(prev.Routes4, next.Routes4)
+	added.Routes6 = missing(prev.Routes6, next.Routes6)
+	added.Sysctl = next.Sysctl && !prev.Sysctl
+	return Apply(added, log)
+}
+
+// missing returns the prefixes in want that are not in have.
+func missing(have, want []netip.Prefix) []netip.Prefix {
+	set := map[netip.Prefix]bool{}
+	for _, p := range have {
+		set[p] = true
+	}
+	var out []netip.Prefix
+	for _, p := range want {
+		if !set[p] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func delRoute(link netlink.Link, p netip.Prefix) error {
+	r := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: prefixToIPNet(p)}
+	if err := netlink.RouteDel(r); err != nil && !errors.Is(err, unix.ESRCH) {
+		return fmt.Errorf("remove route %s via %s: %w", p, link.Attrs().Name, err)
+	}
+	return nil
+}
+
 // Apply brings the interface up, assigns addresses, installs routes and
 // enables forwarding. It is idempotent.
 func Apply(o Options, log *slog.Logger) error {

@@ -12,14 +12,84 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/andreabedini/clatto/internal/config"
+	"github.com/andreabedini/clatto/internal/daemon"
 	"github.com/andreabedini/clatto/internal/netconf"
 	"github.com/andreabedini/clatto/internal/tundev"
 	"github.com/andreabedini/clatto/internal/xlate"
 )
+
+const e2eYAML = `
+interface: {name: clat-e2e, sysctl: false}
+ipv4_address: 10.0.0.254
+ipv6_address: 2001:db8::fe
+prefix: 64:ff9b::/96
+wkpf_strict: false
+maps:
+  - {ipv4: 10.0.0.2, ipv6: 2001:db8::1}
+`
+
+func routes(t *testing.T, family string) string {
+	t.Helper()
+	out, err := exec.Command("ip", family, "route", "show", "dev", "clat-e2e").CombinedOutput()
+	if err != nil {
+		t.Fatalf("ip route: %v: %s", err, out)
+	}
+	return string(out)
+}
+
+// TestReloadUpdatesRoutes applies a new configuration through the daemon and
+// checks that routes are added and removed on the real interface.
+func TestReloadUpdatesRoutes(t *testing.T) {
+	if _, err := os.Stat("/dev/net/tun"); err != nil {
+		t.Skip("/dev/net/tun not available")
+	}
+	var cfg config.Config
+	if err := config.LoadYAML(&cfg, []byte(e2eYAML)); err != nil {
+		t.Fatal(err)
+	}
+	r, err := config.Resolve(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := daemon.New(r, daemon.Options{Log: slog.Default(), Registry: prometheus.NewRegistry()})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	for !d.Ready() {
+		select {
+		case err := <-done:
+			t.Fatalf("daemon: %v", err)
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if !strings.Contains(routes(t, "-4"), "10.0.0.2 ") {
+		t.Fatalf("initial route missing:\n%s", routes(t, "-4"))
+	}
+	updated := strings.Replace(e2eYAML, "{ipv4: 10.0.0.2, ipv6: 2001:db8::1}", "{ipv4: 10.0.0.3, ipv6: 2001:db8::3}\n  - {ipv4: 10.0.1.0/24, ipv6: 2001:db8:1::/120}", 1)
+	if err := d.ApplyYAML([]byte(updated), "e2e"); err != nil {
+		t.Fatal(err)
+	}
+	v4, v6 := routes(t, "-4"), routes(t, "-6")
+	if strings.Contains(v4, "10.0.0.2 ") || !strings.Contains(v4, "10.0.0.3 ") || !strings.Contains(v4, "10.0.1.0/24") {
+		t.Errorf("IPv4 routes not updated:\n%s", v4)
+	}
+	if strings.Contains(v6, "2001:db8::1 ") || !strings.Contains(v6, "2001:db8::3 ") || !strings.Contains(v6, "2001:db8:1::/120") {
+		t.Errorf("IPv6 routes not updated:\n%s", v6)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestUDPThroughTranslator(t *testing.T) {
 	if _, err := os.Stat("/dev/net/tun"); err != nil {

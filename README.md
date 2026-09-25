@@ -59,10 +59,42 @@ The process needs `CAP_NET_ADMIN` and `/dev/net/tun`. See
 | `log.level`, `log.format` | `CLATTO_LOG_LEVEL`, `CLATTO_LOG_FORMAT` | `info`/`debug`/..., `json`/`text` |
 | `log.packets` | `CLATTO_LOG_PACKETS` | log packet events: `drop reject icmp self dynamic` |
 | `http.listen` | `CLATTO_HTTP_LISTEN` | admin listener (default `:6464`, `off` disables) |
+| `http.admin` | `CLATTO_HTTP_ADMIN` | allow configuration changes over HTTP (default false) |
 
 `CLATTO_CONFIG` names the file (default `/etc/clatto/config.yaml`) and
 `CLATTO_CONFIG_YAML` can carry a whole document inline. Precedence is
 defaults, file, environment.
+
+## Reloading and the admin API
+
+The configuration is immutable while it runs and is replaced as a whole.
+A replacement is validated first; if it fails, the running configuration
+stays and the error is logged and shown in `/config/status`. Anything that
+needs the tun device recreated (`interface.name`, `interface.mtu`,
+`interface.configure`, `interface.sysctl`, `http.listen`, `log.format`) is
+rejected with an explicit error rather than restarting. Everything else,
+including routes and the dynamic pool, changes in place; the pool keeps its
+assignments when its prefix is unchanged.
+
+Reloads happen on `SIGHUP`, when the configuration file changes (it is
+polled every two seconds, which suits ConfigMap volumes; `-no-watch`
+disables this) and through the API:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /healthz`, `GET /readyz` | liveness; readiness once packets flow |
+| `GET /metrics` | Prometheus metrics |
+| `GET /config` | effective configuration as YAML |
+| `GET /config/status` | generation, source and last error as JSON |
+| `GET /dynamic` | dynamic pool assignments as JSON |
+| `PUT /config` | replace the configuration with the YAML or JSON body (needs `http.admin: true`) |
+| `POST /config/reload` | re-read the file and environment (needs `http.admin: true`) |
+
+`PUT /config` takes a complete document, so fetch `/config`, edit, and put
+it back. The file and environment are not merged into it. A later file
+change replaces it again. Since the listener is normally reachable on the
+pod IP, enable `http.admin` only with the listener bound to `127.0.0.1`,
+where only containers in the same pod can reach it.
 
 ## Metrics
 
@@ -70,6 +102,8 @@ defaults, file, environment.
 - `clatto_packet_events_total{family,kind,reason}` for drops, rejects,
   generated ICMP and self-addressed packets
 - `clatto_dynamic_pool_{size,mapped,dormant}`
+- `clatto_config_generation`, `clatto_config_reloads_total{source,result}`,
+  `clatto_config_last_success_timestamp_seconds`
 - `clatto_tun_{packets,bytes}_{received,sent}_total`, `clatto_tun_{read,write}_errors_total`
 
 ## Building

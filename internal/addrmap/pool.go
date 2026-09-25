@@ -118,6 +118,42 @@ func NewPool(prefix netip.Prefix, o PoolOptions) (*Pool, error) {
 // Prefix returns the pool prefix.
 func (p *Pool) Prefix() netip.Prefix { return p.prefix }
 
+// SetLeases changes the lease times for subsequent maintenance passes.
+func (p *Pool) SetLeases(minLease, maxLease time.Duration) {
+	if minLease <= 0 {
+		minLease = DefaultMinLease
+	}
+	if maxLease <= 0 {
+		maxLease = DefaultMaxLease
+	}
+	p.mu.Lock()
+	p.minLease, p.maxLease = minLease, maxLease
+	p.mu.Unlock()
+}
+
+// Assignment is one dynamic mapping for display.
+type Assignment struct {
+	IPv4    netip.Addr `json:"ipv4" yaml:"ipv4"`
+	IPv6    netip.Addr `json:"ipv6" yaml:"ipv6"`
+	LastUse time.Time  `json:"last_use" yaml:"last_use"`
+	Dormant bool       `json:"dormant,omitempty" yaml:"dormant,omitempty"`
+}
+
+// Assignments lists all current assignments ordered by IPv4 address.
+func (p *Pool) Assignments() []Assignment {
+	p.mu.RLock()
+	out := make([]Assignment, 0, len(p.mapped)+len(p.dormant))
+	for _, d := range p.mapped {
+		out = append(out, Assignment{IPv4: d.v4, IPv6: d.v6, LastUse: time.Unix(d.lastUse.Load(), 0).UTC()})
+	}
+	for _, d := range p.dormant {
+		out = append(out, Assignment{IPv4: d.v4, IPv6: d.v6, LastUse: time.Unix(d.lastUse.Load(), 0).UTC(), Dormant: true})
+	}
+	p.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].IPv4.Less(out[j].IPv4) })
+	return out
+}
+
 // SetObserver replaces the event observer. It must be called before the
 // pool sees traffic.
 func (p *Pool) SetObserver(obs xlate.Observer) {

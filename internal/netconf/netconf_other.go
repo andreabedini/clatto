@@ -21,3 +21,8 @@ type Options struct {
 func Apply(Options, *slog.Logger) error {
 	return errors.New("interface configuration is only supported on Linux")
 }
+
+// Update is not supported on this platform.
+func Update(Options, Options, *slog.Logger) error {
+	return errors.New("interface configuration is only supported on Linux")
+}

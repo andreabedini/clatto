@@ -5,6 +5,7 @@ package observe
 import (
 	"log/slog"
 	"strconv"
+	"sync/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -73,16 +74,44 @@ func (m *Metrics) Event(e xlate.Event) {
 	m.events[familyIndex(e.Family)][e.Kind][e.Reason].Inc()
 }
 
-// RegisterPool exposes dynamic pool occupancy.
-func RegisterPool(reg prometheus.Registerer, pool *addrmap.Pool) {
+// RegisterPool exposes dynamic pool occupancy. pool returns the current
+// pool, or nil when none is configured.
+func RegisterPool(reg prometheus.Registerer, pool func() *addrmap.Pool) {
+	stat := func(get func(addrmap.Stats) int) func() float64 {
+		return func() float64 {
+			p := pool()
+			if p == nil {
+				return 0
+			}
+			return float64(get(p.Stats()))
+		}
+	}
 	reg.MustRegister(
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "clatto_dynamic_pool_size", Help: "Addresses available in the dynamic pool."},
-			func() float64 { return float64(pool.Stats().Size) }),
+			stat(func(s addrmap.Stats) int { return s.Size })),
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "clatto_dynamic_pool_mapped", Help: "Dynamic assignments currently active."},
-			func() float64 { return float64(pool.Stats().Mapped) }),
+			stat(func(s addrmap.Stats) int { return s.Mapped })),
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: "clatto_dynamic_pool_dormant", Help: "Dynamic assignments idle but still reserved."},
-			func() float64 { return float64(pool.Stats().Dormant) }),
+			stat(func(s addrmap.Stats) int { return s.Dormant })),
 	)
+}
+
+// ConfigMetrics tracks configuration reloads.
+type ConfigMetrics struct {
+	Generation prometheus.Gauge
+	LastReload prometheus.Gauge
+	Reloads    *prometheus.CounterVec
+}
+
+// NewConfigMetrics registers reload metrics.
+func NewConfigMetrics(reg prometheus.Registerer) *ConfigMetrics {
+	m := &ConfigMetrics{
+		Generation: prometheus.NewGauge(prometheus.GaugeOpts{Name: "clatto_config_generation", Help: "Number of the configuration currently applied; increments on every successful reload."}),
+		LastReload: prometheus.NewGauge(prometheus.GaugeOpts{Name: "clatto_config_last_success_timestamp_seconds", Help: "Unix time of the last successfully applied configuration."}),
+		Reloads:    prometheus.NewCounterVec(prometheus.CounterOpts{Name: "clatto_config_reloads_total", Help: "Configuration reload attempts by source and result."}, []string{"source", "result"}),
+	}
+	reg.MustRegister(m.Generation, m.LastReload, m.Reloads)
+	return m
 }
 
 // RegisterEngine exposes tun device counters.
@@ -110,18 +139,25 @@ func RegisterBuildInfo(reg prometheus.Registerer, version string) {
 // PacketLogger logs packet events of selected kinds.
 type PacketLogger struct {
 	log   *slog.Logger
-	kinds [xlate.NumKinds]bool
+	kinds atomic.Pointer[[xlate.NumKinds]bool]
 }
 
 // NewPacketLogger logs events whose kind is enabled in kinds.
 func NewPacketLogger(log *slog.Logger, kinds map[xlate.Kind]bool) *PacketLogger {
 	pl := &PacketLogger{log: log}
+	pl.SetKinds(kinds)
+	return pl
+}
+
+// SetKinds replaces the set of logged kinds.
+func (pl *PacketLogger) SetKinds(kinds map[xlate.Kind]bool) {
+	var arr [xlate.NumKinds]bool
 	for k, on := range kinds {
 		if int(k) < xlate.NumKinds {
-			pl.kinds[k] = on
+			arr[k] = on
 		}
 	}
-	return pl
+	pl.kinds.Store(&arr)
 }
 
 // Translated implements xlate.Observer.
@@ -129,7 +165,7 @@ func (*PacketLogger) Translated(uint8, int) {}
 
 // Event implements xlate.Observer.
 func (pl *PacketLogger) Event(e xlate.Event) {
-	if int(e.Kind) >= xlate.NumKinds || !pl.kinds[e.Kind] {
+	if int(e.Kind) >= xlate.NumKinds || !pl.kinds.Load()[e.Kind] {
 		return
 	}
 	if e.Kind == xlate.KindDynamic {

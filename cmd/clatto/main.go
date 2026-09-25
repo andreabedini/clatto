@@ -18,18 +18,14 @@ import (
 
 	"github.com/andreabedini/clatto/internal/admin"
 	"github.com/andreabedini/clatto/internal/config"
-	"github.com/andreabedini/clatto/internal/netconf"
+	"github.com/andreabedini/clatto/internal/daemon"
 	"github.com/andreabedini/clatto/internal/observe"
-	"github.com/andreabedini/clatto/internal/tundev"
-	"github.com/andreabedini/clatto/internal/xlate"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
-const (
-	poolMaintainInterval = 45 * time.Second
-)
+const fileWatchInterval = 2 * time.Second
 
 func main() {
 	os.Exit(run())
@@ -45,6 +41,7 @@ func run() int {
 		check       = flag.Bool("check", false, "validate the configuration and exit")
 		printConfig = flag.Bool("print-config", false, "print the effective configuration as YAML and exit")
 		showVersion = flag.Bool("version", false, "print the version and exit")
+		noWatch     = flag.Bool("no-watch", false, "do not reload when the configuration file changes")
 	)
 	flag.Parse()
 	if *showVersion {
@@ -53,17 +50,25 @@ func run() int {
 	}
 
 	bootLog := slog.New(slog.NewTextHandler(os.Stderr, nil))
-
-	var cfg config.Config
 	explicit := *configPath != defaultPath
-	if err := config.LoadFile(&cfg, *configPath); err != nil {
-		if explicit || !errors.Is(err, os.ErrNotExist) {
-			bootLog.Error("load configuration file", "path", *configPath, "error", err)
-			return 2
+
+	// load reads the file (if present) and the environment.
+	load := func() (config.Config, error) {
+		var cfg config.Config
+		if err := config.LoadFile(&cfg, *configPath); err != nil {
+			if explicit || !errors.Is(err, os.ErrNotExist) {
+				return cfg, fmt.Errorf("load %s: %w", *configPath, err)
+			}
 		}
+		if err := config.LoadEnv(&cfg, os.LookupEnv); err != nil {
+			return cfg, fmt.Errorf("environment: %w", err)
+		}
+		return cfg, nil
 	}
-	if err := config.LoadEnv(&cfg, os.LookupEnv); err != nil {
-		bootLog.Error("environment configuration", "error", err)
+
+	cfg, err := load()
+	if err != nil {
+		bootLog.Error("configuration", "error", err)
 		return 2
 	}
 	resolved, err := config.Resolve(cfg, nil)
@@ -88,9 +93,11 @@ func run() int {
 		return 0
 	}
 
-	// Logging.
+	// Logging: the level can change on reload, the format cannot.
+	level := new(slog.LevelVar)
+	level.Set(resolved.LogLevel)
+	opts := &slog.HandlerOptions{Level: level}
 	var handler slog.Handler
-	opts := &slog.HandlerOptions{Level: resolved.LogLevel}
 	if resolved.LogJSON {
 		handler = slog.NewJSONHandler(os.Stdout, opts)
 	} else {
@@ -98,7 +105,7 @@ func run() int {
 	}
 	log := slog.New(handler)
 	slog.SetDefault(log)
-	log.Info("starting clatto", "version", version)
+	log.Info("starting clatto", "version", version, "config", *configPath)
 	for _, w := range resolved.Warnings {
 		log.Warn(w)
 	}
@@ -107,118 +114,63 @@ func run() int {
 	}
 	log.Info("translator addresses", "ipv4", resolved.Xlate.LocalAddr4, "ipv6", resolved.Xlate.LocalAddr6)
 
-	// Observers.
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	observe.RegisterBuildInfo(reg, version)
-	metrics := observe.NewMetrics(reg)
-	obs := xlate.MultiObserver{metrics, observe.NewPacketLogger(log, resolved.PacketKinds)}
-	if resolved.Pool != nil {
-		resolved.Pool.SetObserver(obs)
-		observe.RegisterPool(reg, resolved.Pool)
-		if sf := resolved.Config.DynamicPool.StateFile; sf != "" {
-			n, err := resolved.Pool.Load(sf)
-			if err != nil {
-				log.Error("load dynamic pool state", "path", sf, "error", err)
-			} else {
-				log.Info("loaded dynamic pool state", "path", sf, "entries", n)
-			}
-		}
-	}
+
+	d := daemon.New(resolved, daemon.Options{Log: log, Level: level, Registry: reg, LoadFile: load})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	// Admin server starts first so liveness works while the tun is set up.
-	adm := admin.New(reg, version, func() ([]byte, error) { return config.Marshal(resolved.Config) })
 	adminErr := make(chan error, 1)
 	if resolved.HTTPListen != "" {
-		go func() { adminErr <- adm.Serve(ctx, resolved.HTTPListen, log) }()
+		srv := admin.New(reg, version, d, resolved.Config.HTTP.Admin)
+		go func() { adminErr <- srv.Serve(ctx, resolved.HTTPListen, log) }()
 	}
 
-	// Tun device and kernel configuration.
-	dev, err := tundev.Create(resolved.Config.Interface.Name, resolved.Config.Interface.MTU)
-	if err != nil {
-		log.Error("create tun device", "name", resolved.Config.Interface.Name, "error", err,
-			"hint", "the container needs CAP_NET_ADMIN and access to /dev/net/tun")
-		return 1
-	}
-	name, _ := dev.Name()
-	log.Info("tun device created", "name", name, "mtu", resolved.Config.Interface.MTU, "batch", dev.BatchSize())
-	if resolved.Configure() {
-		err := netconf.Apply(netconf.Options{
-			Name:      name,
-			Addresses: resolved.Config.Interface.Addresses,
-			Routes4:   resolved.Routes4,
-			Routes6:   resolved.Routes6,
-			Sysctl:    resolved.Sysctl(),
-		}, log)
-		if err != nil {
-			log.Error("configure interface", "error", err)
-			dev.Close()
-			return 1
-		}
-	} else {
-		log.Info("interface configuration disabled; bring the link up and add routes yourself")
-	}
-
-	translator := xlate.New(resolved.Xlate, resolved.Table, obs)
-	eng := tundev.NewEngine(dev, translator, log)
-	observe.RegisterEngine(reg, eng)
-	engineErr := make(chan error, 1)
-	go func() { engineErr <- eng.Run(ctx) }()
-	adm.SetReady(true)
-	log.Info("translating")
-
-	// Dynamic pool maintenance and persistence.
-	maintDone := make(chan struct{})
+	// Reload on SIGHUP and on configuration file changes.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
-		defer close(maintDone)
-		if resolved.Pool == nil {
-			return
-		}
-		sf := resolved.Config.DynamicPool.StateFile
-		t := time.NewTicker(poolMaintainInterval)
-		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-t.C:
-				resolved.Pool.Maintain()
-				if sf != "" && resolved.Pool.Dirty() {
-					if err := resolved.Pool.Save(sf); err != nil {
-						log.Error("save dynamic pool state", "path", sf, "error", err)
-					}
-				}
+			case <-hup:
+				d.Reload("sighup")
 			}
 		}
 	}()
+	if !*noWatch {
+		if _, err := os.Stat(*configPath); err == nil {
+			go d.WatchFile(ctx, *configPath, fileWatchInterval)
+		}
+	}
+
+	daemonErr := make(chan error, 1)
+	go func() { daemonErr <- d.Run(ctx) }()
 
 	exit := 0
 	select {
 	case <-ctx.Done():
 		log.Info("shutting down")
-	case err := <-engineErr:
-		log.Error("packet engine stopped", "error", err)
-		exit = 1
+		if err := <-daemonErr; err != nil {
+			log.Error("daemon", "error", err)
+			exit = 1
+		}
+	case err := <-daemonErr:
+		if err != nil {
+			log.Error("daemon stopped", "error", err)
+			exit = 1
+		}
 		stop()
 	case err := <-adminErr:
 		log.Error("admin server stopped", "error", err)
 		exit = 1
 		stop()
-	}
-	adm.SetReady(false)
-	<-maintDone
-	if err := <-engineErr; err != nil && !errors.Is(err, context.Canceled) {
-		log.Error("packet engine", "error", err)
-	}
-	if resolved.Pool != nil {
-		if sf := resolved.Config.DynamicPool.StateFile; sf != "" {
-			if err := resolved.Pool.Save(sf); err != nil {
-				log.Error("save dynamic pool state", "path", sf, "error", err)
-			}
-		}
+		<-daemonErr
 	}
 	return exit
 }

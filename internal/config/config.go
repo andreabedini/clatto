@@ -92,6 +92,9 @@ type Log struct {
 type HTTP struct {
 	// Listen is the address; empty means the default, "off" disables.
 	Listen string `yaml:"listen,omitempty"`
+	// Admin enables the endpoints that change configuration at runtime.
+	// Off by default: the listener is usually reachable from the network.
+	Admin bool `yaml:"admin,omitempty"`
 }
 
 // Resolved is a validated configuration with derived objects.
@@ -278,6 +281,14 @@ func LoadEnv(cfg *Config, lookup func(string) (string, bool)) error {
 	str("LOG_FORMAT", &cfg.Log.Format)
 	strList("LOG_PACKETS", &cfg.Log.Packets)
 	str("HTTP_LISTEN", &cfg.HTTP.Listen)
+	if v, ok := get("HTTP_ADMIN"); ok {
+		b, err := parseBool(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%sHTTP_ADMIN: %w", EnvPrefix, err))
+		} else {
+			cfg.HTTP.Admin = b
+		}
+	}
 
 	// systemd's StateDirectory is honoured like tayga does.
 	if sd, ok := lookup("STATE_DIRECTORY"); ok && cfg.DynamicPool != nil && cfg.DynamicPool.StateFile == "" {
@@ -336,9 +347,49 @@ func ParseUDPChecksum(s string) (xlate.UDPChecksumMode, error) {
 	return 0, fmt.Errorf("udp_checksum: expected drop, calc or forward, got %q", s)
 }
 
+// ResolveOptions tunes Resolve.
+type ResolveOptions struct {
+	// Observer is attached to a newly created dynamic pool.
+	Observer xlate.Observer
+	// ExistingPool is reused, keeping its assignments, when the configured
+	// pool prefix matches its prefix.
+	ExistingPool *addrmap.Pool
+}
+
 // Resolve validates cfg and derives everything the daemon needs. obs is
 // attached to the dynamic pool for event reporting.
 func Resolve(cfg Config, obs xlate.Observer) (*Resolved, error) {
+	return ResolveWith(cfg, ResolveOptions{Observer: obs})
+}
+
+// ImmutableChanges lists the settings that differ between old and new and
+// cannot change without a restart.
+func ImmutableChanges(old, new *Resolved) []string {
+	var out []string
+	if old.Config.Interface.Name != new.Config.Interface.Name {
+		out = append(out, "interface.name")
+	}
+	if old.Config.Interface.MTU != new.Config.Interface.MTU {
+		out = append(out, "interface.mtu")
+	}
+	if old.Configure() != new.Configure() {
+		out = append(out, "interface.configure")
+	}
+	if old.Sysctl() != new.Sysctl() {
+		out = append(out, "interface.sysctl")
+	}
+	if old.HTTPListen != new.HTTPListen {
+		out = append(out, "http.listen")
+	}
+	if old.LogJSON != new.LogJSON {
+		out = append(out, "log.format")
+	}
+	return out
+}
+
+// ResolveWith is Resolve with options.
+func ResolveWith(cfg Config, ro ResolveOptions) (*Resolved, error) {
+	obs := ro.Observer
 	r := &Resolved{Config: cfg, PacketKinds: map[xlate.Kind]bool{}}
 	var errs []error
 	fail := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
@@ -452,7 +503,14 @@ func Resolve(cfg Config, obs xlate.Observer) (*Resolved, error) {
 		if !dp.Prefix.IsValid() {
 			fail("dynamic_pool.prefix is required")
 		} else {
-			pool, err := addrmap.NewPool(dp.Prefix, addrmap.PoolOptions{MinLease: dp.MinLease, MaxLease: dp.MaxLease, Observer: obs})
+			var pool *addrmap.Pool
+			var err error
+			if ro.ExistingPool != nil && ro.ExistingPool.Prefix() == dp.Prefix {
+				pool = ro.ExistingPool
+				pool.SetLeases(dp.MinLease, dp.MaxLease)
+			} else {
+				pool, err = addrmap.NewPool(dp.Prefix, addrmap.PoolOptions{MinLease: dp.MinLease, MaxLease: dp.MaxLease, Observer: obs})
+			}
 			if err != nil {
 				fail("dynamic_pool: %v", err)
 			} else {
