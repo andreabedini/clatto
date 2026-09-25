@@ -164,6 +164,24 @@ go test ./...
 test/e2e.sh        # real tun device in a throwaway network namespace (no root needed)
 ```
 
+### Benchmarking against tayga
+
+```sh
+test/bench.sh /path/to/tayga     # or set TAYGA; without it only clatto runs
+DURATION=10 FLOWS="1 4" SIZES="64 1400" test/bench.sh
+```
+
+The script runs each translator in turn in a throwaway network namespace
+and pushes UDP blasts and TCP streams from an IPv6 client through it to
+an IPv4 server, both on `lo`. For every case it prints the throughput
+that made it across, UDP loss, and the translator's CPU time per packet
+(UDP, one direction) or per megabyte (TCP, where acknowledgements cross
+it too). The CPU figures are what matter for a sidecar; the throughput of
+a single tun device is bounded by the kernel copying every packet through
+it and by the sender, not only by the translator. `test/bench` is the Go
+program behind it, usable on its own against any translator whose tun
+device carries the same routes.
+
 The image is built with [ko](https://ko.build) from `.ko.yaml`: the static
 binary on `gcr.io/distroless/static-debian12`, for `linux/amd64` and
 `linux/arm64`. CI pushes `ghcr.io/andreabedini/clatto`
