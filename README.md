@@ -78,7 +78,7 @@ defaults, file, environment.
 go build ./cmd/clatto
 podman build -t clatto .
 go test ./...
-sudo test/e2e.sh   # real tun device in a throwaway network namespace
+test/e2e.sh        # real tun device in a throwaway network namespace (no root needed)
 ```
 
 ## License
