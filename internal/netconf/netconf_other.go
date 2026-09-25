@@ -8,21 +8,13 @@ import (
 	"net/netip"
 )
 
-// Options describes the desired state.
-type Options struct {
-	Name      string
-	Addresses []netip.Prefix
-	Routes4   []netip.Prefix
-	Routes6   []netip.Prefix
-	Sysctl    bool
-}
+var errUnsupported = errors.New("interface configuration is only supported on Linux")
 
 // Apply is not supported on this platform.
-func Apply(Options, *slog.Logger) error {
-	return errors.New("interface configuration is only supported on Linux")
-}
+func Apply(Options, *slog.Logger) error { return errUnsupported }
 
 // Update is not supported on this platform.
-func Update(Options, Options, *slog.Logger) error {
-	return errors.New("interface configuration is only supported on Linux")
-}
+func Update(Options, Options, *slog.Logger) error { return errUnsupported }
+
+// SourceAddress is not supported on this platform.
+func SourceAddress(netip.Addr) (netip.Addr, error) { return netip.Addr{}, errUnsupported }

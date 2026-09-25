@@ -1,0 +1,31 @@
+# A CLAT that shares the host's own IPv6 address (RFC 6877 with the host
+# as the IPv6 side), for hosts with a single routed address such as a
+# Kubernetes pod on an IPv6-only network: there is no /64 to take a
+# dedicated CLAT address from.
+#
+# Applications use 192.0.0.1 and the IPv4 default route via the tun device.
+# clatto maps 192.0.0.1 to the pod address and embeds every IPv4 destination
+# in the PLAT prefix. Because the pod address is local, the kernel's local
+# table would swallow the PLAT's replies; clatto moves that rule behind one
+# that sends traffic from the prefix to the pod address back through the
+# tun device (rule priority 1, local table at 2, route in table 0xc1a7).
+# All of this is idempotent, so a restarted container in the same network
+# namespace finds and keeps its earlier setup.
+prefix: 64:ff9b::/96
+clat:
+  ipv6_address: auto        # the source address towards the prefix; or set it explicitly
+  # ipv4_address: 192.0.0.1 # the host's IPv4 address, assigned to the interface
+  # table: 0xc1a7           # policy routing table
+  # Return traffic from the prefix to the pod address that should be
+  # translated. Without a list, everything is, including replies to the
+  # pod's own connections to DNS64-synthesised addresses, which then
+  # never reach their IPv6 sockets. Pin the CLAT users' local ports
+  # outside net.ipv4.ip_local_port_range and list them here.
+  # ports: [udp/61000-61099, tcp/61000-61099, icmp]
+# ipv4_address: 192.0.0.2   # the translator's own address (default in CLAT mode)
+interface:
+  name: clat
+  sysctl: false             # the pod sets net.ipv6.conf.all.forwarding=1 itself
+  routes:
+    # The automatic default route, with clatd's conservative options.
+    - {prefix: 0.0.0.0/0, metric: 2048, mtu: 1260, advmss: 1220}

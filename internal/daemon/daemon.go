@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -39,6 +40,9 @@ type Options struct {
 	NewDevice func(name string, mtu int) (tundev.Device, error)
 	// MaintainInterval is how often the dynamic pool is aged and saved.
 	MaintainInterval time.Duration
+	// SourceAddr resolves clat.ipv6_address "auto" on reload; defaults to
+	// netconf.SourceAddress.
+	SourceAddr func(dst netip.Addr) (netip.Addr, error)
 }
 
 // Status describes the configuration state.
@@ -88,6 +92,9 @@ func New(initial *config.Resolved, o Options) *Daemon {
 	}
 	if o.MaintainInterval <= 0 {
 		o.MaintainInterval = 45 * time.Second
+	}
+	if o.SourceAddr == nil {
+		o.SourceAddr = netconf.SourceAddress
 	}
 	d := &Daemon{o: o, log: o.Log, cur: initial}
 	d.metrics = observe.NewMetrics(o.Registry)
@@ -240,10 +247,12 @@ loop:
 func (d *Daemon) netconfOptions(r *config.Resolved, name string) netconf.Options {
 	return netconf.Options{
 		Name:      name,
-		Addresses: r.Config.Interface.Addresses,
+		Addresses: r.Addresses,
 		Routes4:   r.Routes4,
 		Routes6:   r.Routes6,
-		Sysctl:    r.Sysctl(),
+		Forward4:  r.Forward4(),
+		Forward6:  r.Forward6(),
+		Shared:    r.Shared,
 	}
 }
 
@@ -275,7 +284,7 @@ func (d *Daemon) Apply(cfg config.Config, source string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	r, err := config.ResolveWith(cfg, config.ResolveOptions{Observer: d.obs, ExistingPool: d.cur.Pool})
+	r, err := config.ResolveWith(cfg, config.ResolveOptions{Observer: d.obs, ExistingPool: d.cur.Pool, SourceAddr: d.o.SourceAddr})
 	if err != nil {
 		return d.failLocked(source, fmt.Errorf("%w: %v", ErrInvalid, err))
 	}

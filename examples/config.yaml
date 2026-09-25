@@ -8,7 +8,7 @@ interface:
   # auto_routes: true  # route every mapped prefix via the interface
   # sysctl: true       # enable net.ipv4.ip_forward and net.ipv6.conf.all.forwarding
   # addresses: []      # extra addresses to assign to the interface
-  # routes: []         # extra routes via the interface
+  # routes: []         # extra routes via the interface: 10.0.0.0/8 or {prefix: 0.0.0.0/0, metric: 2048, mtu: 1260, advmss: 1220}
 
 # The translator's own addresses. It answers pings on them and sources ICMP
 # errors from them. ipv6_address is derived from ipv4_address and the prefix
@@ -34,6 +34,11 @@ dynamic_pool:
   # state_file: /var/lib/clatto/dynamic.map   # persist assignments across restarts
   # min_lease: 2h4m
   # max_lease: 336h
+
+# CLAT sharing the host's own IPv6 address; see examples/clat-shared.yaml.
+# clat:
+#   ipv6_address: auto
+#   ports: [udp/61000-61099]
 
 # UDP datagrams without a checksum: drop (RFC 7915), calc, or forward.
 udp_checksum: drop

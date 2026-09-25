@@ -1,0 +1,74 @@
+# Example: CLAT sidecar giving an IPv6-only pod IPv4 connectivity through a
+# NAT64 gateway (PLAT) at 64:ff9b::/96. The CLAT shares the pod's own IPv6
+# address; see examples/clat-shared.yaml for the configuration.
+#
+# clatto runs as a native sidecar (an init container with
+# restartPolicy: Always) so that it is up, with routes and rules in place,
+# before the application containers start: /readyz only answers once the
+# kernel is configured and packets are being translated.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clatto
+data:
+  config.yaml: |
+    prefix: 64:ff9b::/96
+    clat:
+      ipv6_address: auto
+    interface:
+      name: clat
+      sysctl: false
+      routes:
+        - {prefix: 0.0.0.0/0, metric: 2048, mtu: 1260, advmss: 1220}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-with-clat
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: app-with-clat}
+  template:
+    metadata:
+      labels: {app: app-with-clat}
+    spec:
+      initContainers:
+        - name: clatto
+          image: ghcr.io/andreabedini/clatto:latest
+          restartPolicy: Always
+          args: ["-config", "/etc/clatto/config.yaml"]
+          env:
+            # Alternatively, without "auto": the pod IP from the Downward API.
+            # - {name: CLATTO_CLAT_IPV6_ADDRESS, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
+            # - {name: CLATTO_CLAT_PORTS, value: "udp/61000-61099 tcp/61000-61099"}
+            - {name: CLATTO_HTTP_LISTEN, value: "127.0.0.1:6464"}
+          startupProbe:
+            httpGet: {path: /readyz, port: 6464, host: 127.0.0.1}
+            periodSeconds: 1
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: {path: /healthz, port: 6464, host: 127.0.0.1}
+          securityContext:
+            capabilities:
+              drop: [ALL]
+              add: [NET_ADMIN]
+          volumeMounts:
+            - {name: config, mountPath: /etc/clatto, readOnly: true}
+            - {name: tun, mountPath: /dev/net/tun}
+      containers:
+        - name: app
+          image: docker.io/library/busybox:1.36
+          command: ["sh", "-c", "sleep infinity"]
+      securityContext:
+        sysctls:
+          # IPv6 forwarding lets packets from the tun device leave through
+          # eth0 and vice versa; IPv4 forwarding is not needed. Setting
+          # forwarding turns off router advertisements unless accept_ra=2.
+          - {name: net.ipv6.conf.all.forwarding, value: "1"}
+          - {name: net.ipv6.conf.eth0.accept_ra, value: "2"}
+      volumes:
+        - name: config
+          configMap: {name: clatto}
+        - name: tun
+          hostPath: {path: /dev/net/tun, type: CharDevice}

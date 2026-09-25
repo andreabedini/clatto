@@ -19,6 +19,7 @@ import (
 	"github.com/andreabedini/clatto/internal/admin"
 	"github.com/andreabedini/clatto/internal/config"
 	"github.com/andreabedini/clatto/internal/daemon"
+	"github.com/andreabedini/clatto/internal/netconf"
 	"github.com/andreabedini/clatto/internal/observe"
 )
 
@@ -71,7 +72,7 @@ func run() int {
 		bootLog.Error("configuration", "error", err)
 		return 2
 	}
-	resolved, err := config.Resolve(cfg, nil)
+	resolved, err := config.ResolveWith(cfg, config.ResolveOptions{SourceAddr: netconf.SourceAddress})
 	if err != nil {
 		bootLog.Error("invalid configuration", "error", err)
 		return 2

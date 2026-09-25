@@ -16,6 +16,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/andreabedini/clatto/internal/addrmap"
+	"github.com/andreabedini/clatto/internal/netconf"
 	"github.com/andreabedini/clatto/internal/netutil"
 	"github.com/andreabedini/clatto/internal/xlate"
 )
@@ -28,6 +29,23 @@ const (
 	DefaultHTTPListen = ":6464"
 	DefaultConfigPath = "/etc/clatto/config.yaml"
 	EnvPrefix         = "CLATTO_"
+	// DefaultCLATTable is the policy routing table a shared-address CLAT
+	// uses ("clat").
+	DefaultCLATTable = 0xc1a7
+)
+
+// Reserved routing tables (rtnetlink's RT_TABLE_*).
+const (
+	rtTableDefault = 253
+	rtTableMain    = 254
+	rtTableLocal   = 255
+)
+
+// Default addresses of a CLAT: the host side is the RFC 7335 well-known
+// address, the translator takes the next one.
+var (
+	DefaultCLATHostIPv4       = netip.MustParseAddr("192.0.0.1")
+	DefaultCLATTranslatorIPv4 = netip.MustParseAddr("192.0.0.2")
 )
 
 // Config is the user-facing configuration. Zero values mean "default".
@@ -39,10 +57,90 @@ type Config struct {
 	WKPFStrict  *bool        `yaml:"wkpf_strict,omitempty"`
 	Maps        []Map        `yaml:"maps,omitempty"`
 	DynamicPool *DynamicPool `yaml:"dynamic_pool,omitempty"`
+	CLAT        *CLAT        `yaml:"clat,omitempty"`
 	UDPChecksum string       `yaml:"udp_checksum,omitempty"`
 	OfflinkMTU  int          `yaml:"offlink_mtu,omitempty"`
 	Log         Log          `yaml:"log,omitempty"`
 	HTTP        HTTP         `yaml:"http,omitempty"`
+}
+
+// CLAT makes clatto a customer-side translator (RFC 6877) that shares one
+// of the host's own IPv6 addresses instead of using a dedicated one. This
+// is the only option on a host with a single routed address, such as a
+// pod. The host's IPv4 address is assigned to the interface and mapped to
+// the shared IPv6 address, an IPv4 default route via the interface is
+// installed instead of a route for the prefix, and policy routing sends
+// replies from the prefix to the shared address through the interface
+// ahead of the kernel's local table. IPv4 forwarding is not needed.
+type CLAT struct {
+	// IPv6Address is the address shared with the host: an IPv6 address,
+	// or "auto" (the default) for the source address the kernel picks to
+	// reach the prefix.
+	IPv6Address string `yaml:"ipv6_address,omitempty"`
+	// IPv4Address is the host's IPv4 address. Default 192.0.0.1.
+	IPv4Address netip.Addr `yaml:"ipv4_address"`
+	// Ports limits the traffic from the prefix that is translated back to
+	// IPv4: "tcp/N-M", "udp/N-M", "tcp/N" or "icmp", one rule each. Empty
+	// means everything from the prefix to the shared address, which also
+	// catches replies to the host's own connections to NAT64-synthesised
+	// addresses.
+	Ports []string `yaml:"ports,omitempty"`
+	// Table is the policy routing table. Default 0xc1a7.
+	Table int `yaml:"table,omitempty"`
+}
+
+// Route is a route via the interface: in YAML either a bare prefix or a
+// mapping with prefix and options.
+type Route struct {
+	Prefix netip.Prefix `yaml:"prefix"`
+	Metric int          `yaml:"metric,omitempty"`
+	MTU    int          `yaml:"mtu,omitempty"`
+	AdvMSS int          `yaml:"advmss,omitempty"`
+}
+
+// UnmarshalYAML accepts "0.0.0.0/0" as well as {prefix: 0.0.0.0/0, metric: 2048}.
+func (r *Route) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind == yaml.ScalarNode {
+		p, err := parseAddrOrPrefix(n.Value)
+		if err != nil {
+			return fmt.Errorf("line %d: route: %w", n.Line, err)
+		}
+		*r = Route{Prefix: p}
+		return nil
+	}
+	if n.Kind != yaml.MappingNode {
+		return fmt.Errorf("line %d: route must be a prefix or a mapping", n.Line)
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		switch k := n.Content[i].Value; k {
+		case "prefix", "metric", "mtu", "advmss":
+		default:
+			return fmt.Errorf("line %d: route: unknown field %q", n.Content[i].Line, k)
+		}
+	}
+	type plain Route
+	var p plain
+	if err := n.Decode(&p); err != nil {
+		return err
+	}
+	if !p.Prefix.IsValid() {
+		return fmt.Errorf("line %d: route: prefix is required", n.Line)
+	}
+	*r = Route(p)
+	return nil
+}
+
+// MarshalYAML renders a route without options as a bare prefix.
+func (r Route) MarshalYAML() (any, error) {
+	if r.Metric == 0 && r.MTU == 0 && r.AdvMSS == 0 {
+		return r.Prefix.String(), nil
+	}
+	type plain Route
+	return plain(r), nil
+}
+
+func (r Route) netconf() netconf.Route {
+	return netconf.Route{Prefix: r.Prefix.Masked(), Metric: r.Metric, MTU: r.MTU, AdvMSS: r.AdvMSS}
 }
 
 // Interface describes the tun device and how much of the surrounding
@@ -56,11 +154,13 @@ type Interface struct {
 	// Addresses are assigned to the interface.
 	Addresses []netip.Prefix `yaml:"addresses,omitempty"`
 	// Routes are installed via the interface in addition to the automatic
-	// ones.
-	Routes []netip.Prefix `yaml:"routes,omitempty"`
-	// AutoRoutes installs routes for every mapped prefix. Default true.
+	// ones; a route here replaces the automatic route for the same prefix.
+	Routes []Route `yaml:"routes,omitempty"`
+	// AutoRoutes installs routes for every mapped prefix (in CLAT mode: an
+	// IPv4 default route). Default true.
 	AutoRoutes *bool `yaml:"auto_routes,omitempty"`
-	// Sysctl enables IPv4 and IPv6 forwarding. Default true.
+	// Sysctl enables IPv4 and IPv6 forwarding (in CLAT mode: IPv6 only).
+	// Default true.
 	Sysctl *bool `yaml:"sysctl,omitempty"`
 }
 
@@ -103,9 +203,14 @@ type Resolved struct {
 	Xlate  xlate.Config
 	Table  *addrmap.Table
 	Pool   *addrmap.Pool
-	// Routes4 and Routes6 are the prefixes to route via the interface.
-	Routes4 []netip.Prefix
-	Routes6 []netip.Prefix
+	// Addresses are assigned to the interface.
+	Addresses []netip.Prefix
+	// Routes4 and Routes6 are the routes to install via the interface.
+	Routes4 []netconf.Route
+	Routes6 []netconf.Route
+	// Shared is the policy routing of a CLAT sharing the host's address;
+	// nil otherwise.
+	Shared *netconf.Shared
 	// Warnings are non-fatal findings worth logging.
 	Warnings []string
 	// LogLevel, LogJSON and PacketKinds are the parsed log settings.
@@ -120,6 +225,13 @@ func (r *Resolved) Configure() bool { return boolOr(r.Config.Interface.Configure
 
 // Sysctl reports whether forwarding sysctls should be set.
 func (r *Resolved) Sysctl() bool { return r.Configure() && boolOr(r.Config.Interface.Sysctl, true) }
+
+// Forward4 reports whether IPv4 forwarding should be enabled. A CLAT only
+// ever delivers IPv4 packets locally, so it needs none.
+func (r *Resolved) Forward4() bool { return r.Sysctl() && r.Shared == nil }
+
+// Forward6 reports whether IPv6 forwarding should be enabled.
+func (r *Resolved) Forward6() bool { return r.Sysctl() }
 
 func boolOr(p *bool, def bool) bool {
 	if p == nil {
@@ -221,6 +333,26 @@ func LoadEnv(cfg *Config, lookup func(string) (string, bool)) error {
 			*dst = out
 		}
 	}
+	routeList := func(name string, dst *[]Route) {
+		if v, ok := get(name); ok {
+			var out []Route
+			for _, s := range splitList(v) {
+				p, err := parseAddrOrPrefix(s)
+				if err != nil {
+					errs = append(errs, fmt.Errorf("%s%s: %w", EnvPrefix, name, err))
+					return
+				}
+				out = append(out, Route{Prefix: p})
+			}
+			*dst = out
+		}
+	}
+	clat := func() *CLAT {
+		if cfg.CLAT == nil {
+			cfg.CLAT = &CLAT{}
+		}
+		return cfg.CLAT
+	}
 	strList := func(name string, dst *[]string) {
 		if v, ok := get(name); ok {
 			*dst = splitList(v)
@@ -238,11 +370,44 @@ func LoadEnv(cfg *Config, lookup func(string) (string, bool)) error {
 	boolean("INTERFACE_AUTO_ROUTES", &cfg.Interface.AutoRoutes)
 	boolean("INTERFACE_SYSCTL", &cfg.Interface.Sysctl)
 	pfxList("INTERFACE_ADDRESSES", &cfg.Interface.Addresses)
-	pfxList("INTERFACE_ROUTES", &cfg.Interface.Routes)
+	routeList("INTERFACE_ROUTES", &cfg.Interface.Routes)
 	addr("IPV4_ADDRESS", &cfg.IPv4Address)
 	addr("IPV6_ADDRESS", &cfg.IPv6Address)
 	pfx("PREFIX", &cfg.Prefix)
 	boolean("WKPF_STRICT", &cfg.WKPFStrict)
+	if v, ok := get("CLAT"); ok {
+		b, err := parseBool(v)
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Errorf("%sCLAT: %w", EnvPrefix, err))
+		case b:
+			clat()
+		default:
+			cfg.CLAT = nil
+		}
+	}
+	if v, ok := get("CLAT_IPV6_ADDRESS"); ok {
+		clat().IPv6Address = v
+	}
+	if v, ok := get("CLAT_IPV4_ADDRESS"); ok {
+		a, err := netip.ParseAddr(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%sCLAT_IPV4_ADDRESS: %w", EnvPrefix, err))
+		} else {
+			clat().IPv4Address = a
+		}
+	}
+	if v, ok := get("CLAT_PORTS"); ok {
+		clat().Ports = splitList(v)
+	}
+	if v, ok := get("CLAT_TABLE"); ok {
+		n, err := strconv.ParseInt(v, 0, 32)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%sCLAT_TABLE: %w", EnvPrefix, err))
+		} else {
+			clat().Table = int(n)
+		}
+	}
 	if v, ok := get("MAPS"); ok {
 		cfg.Maps = nil
 		for _, s := range splitList(v) {
@@ -354,6 +519,56 @@ type ResolveOptions struct {
 	// ExistingPool is reused, keeping its assignments, when the configured
 	// pool prefix matches its prefix.
 	ExistingPool *addrmap.Pool
+	// SourceAddr resolves clat.ipv6_address "auto": it returns the source
+	// address the kernel uses to reach dst. nil makes "auto" an error.
+	SourceAddr func(dst netip.Addr) (netip.Addr, error)
+}
+
+// ParseFilter parses a clat.ports entry: "tcp/N-M", "udp/N", "sctp/N-M",
+// "icmp", or a bare protocol name for every port.
+func ParseFilter(s string) (netconf.Filter, error) {
+	proto, ports, hasPorts := strings.Cut(s, "/")
+	var f netconf.Filter
+	switch strings.ToLower(proto) {
+	case "tcp":
+		f.Proto = 6
+	case "udp":
+		f.Proto = 17
+	case "sctp":
+		f.Proto = 132
+	case "icmp", "icmpv6", "ipv6-icmp":
+		f.Proto = 58
+	default:
+		return f, fmt.Errorf("%q: protocol must be tcp, udp, sctp or icmp", s)
+	}
+	if !hasPorts {
+		return f, nil
+	}
+	if f.Proto == 58 {
+		return f, fmt.Errorf("%q: icmp takes no port range", s)
+	}
+	lo, hi, isRange := strings.Cut(ports, "-")
+	if !isRange {
+		hi = lo
+	}
+	port := func(v string) (uint16, error) {
+		n, err := strconv.ParseUint(v, 10, 16)
+		if err != nil || n == 0 {
+			return 0, fmt.Errorf("%q: port must be between 1 and 65535", s)
+		}
+		return uint16(n), nil
+	}
+	var err error
+	if f.Start, err = port(lo); err != nil {
+		return f, err
+	}
+	if f.End, err = port(hi); err != nil {
+		return f, err
+	}
+	if f.Start > f.End {
+		return f, fmt.Errorf("%q: port range is reversed", s)
+	}
+	return f, nil
 }
 
 // Resolve validates cfg and derives everything the daemon needs. obs is
@@ -428,6 +643,86 @@ func ResolveWith(cfg Config, ro ResolveOptions) (*Resolved, error) {
 			fail("prefix: %v", err)
 		}
 	}
+
+	// CLAT sharing the host's address.
+	var shared6 netip.Addr
+	if c := cfg.CLAT; c != nil {
+		cc := *c
+		r.Config.CLAT = &cc
+		if !cfg.IPv4Address.IsValid() {
+			cfg.IPv4Address = DefaultCLATTranslatorIPv4
+			r.Config.IPv4Address = cfg.IPv4Address
+		}
+		if !cc.IPv4Address.IsValid() {
+			cc.IPv4Address = DefaultCLATHostIPv4
+		}
+		if !cc.IPv4Address.Is4() {
+			fail("clat.ipv4_address %s is not IPv4", cc.IPv4Address)
+		} else if cc.IPv4Address == cfg.IPv4Address {
+			fail("clat.ipv4_address %s is the translator's own ipv4_address", cc.IPv4Address)
+		}
+		if cc.Table == 0 {
+			cc.Table = DefaultCLATTable
+		}
+		switch cc.Table {
+		case rtTableLocal, rtTableMain, rtTableDefault:
+			fail("clat.table %d is a reserved table", cc.Table)
+		default:
+			if cc.Table < 1 || cc.Table > 0xfffffffe {
+				fail("clat.table %d must be between 1 and 4294967294", cc.Table)
+			}
+		}
+		var filters []netconf.Filter
+		for _, s := range cc.Ports {
+			f, err := ParseFilter(s)
+			if err != nil {
+				fail("clat.ports: %v", err)
+				continue
+			}
+			filters = append(filters, f)
+		}
+		switch {
+		case !cfg.Prefix.IsValid():
+			fail("clat: prefix is required")
+		case cc.IPv6Address == "" || strings.EqualFold(cc.IPv6Address, "auto"):
+			if ro.SourceAddr == nil {
+				fail("clat.ipv6_address: automatic detection is not available here, set the address")
+				break
+			}
+			a, err := ro.SourceAddr(cfg.Prefix.Addr())
+			if err != nil {
+				fail("clat.ipv6_address: %v", err)
+				break
+			}
+			shared6 = a
+			r.Warnings = append(r.Warnings, fmt.Sprintf("clat: sharing the host address %s (source address towards %s)", a, cfg.Prefix))
+		default:
+			a, err := netip.ParseAddr(cc.IPv6Address)
+			if err != nil {
+				fail("clat.ipv6_address: %v", err)
+			} else {
+				shared6 = a
+			}
+		}
+		if shared6.IsValid() {
+			switch {
+			case !shared6.Is6() || shared6.Is4In6():
+				fail("clat.ipv6_address %s is not IPv6", shared6)
+			case !netutil.ValidIPv6(shared6.As16()):
+				fail("clat.ipv6_address %s is a reserved address", shared6)
+			case cfg.Prefix.IsValid() && cfg.Prefix.Contains(shared6):
+				fail("clat.ipv6_address %s must not be inside prefix %s", shared6, cfg.Prefix)
+			default:
+				cc.IPv6Address = shared6.String()
+				if err := b.AddStatic(netip.PrefixFrom(cc.IPv4Address, 32), netip.PrefixFrom(shared6, 128)); err != nil {
+					fail("clat: %v", err)
+				}
+			}
+		}
+		if len(errs) == 0 {
+			r.Shared = &netconf.Shared{Addr: shared6, From: cfg.Prefix, Table: cc.Table, Filters: filters}
+		}
+	}
 	for i, m := range cfg.Maps {
 		p4, err := parseAddrOrPrefix(m.IPv4)
 		if err != nil {
@@ -465,7 +760,18 @@ func ResolveWith(cfg Config, ro ResolveOptions) (*Resolved, error) {
 
 	local6 := cfg.IPv6Address
 	v6Derived := false
+	// derived is the address the prefix embeds ipv4_address at; an explicit
+	// ipv6_address equal to it (as the effective configuration reports)
+	// is treated as derived.
+	var derived netip.Addr
+	if cfg.Prefix.IsValid() && cfg.IPv4Address.Is4() {
+		if a16, err := netutil.Embed(cfg.Prefix.Addr().As16(), cfg.Prefix.Bits(), cfg.IPv4Address.As4()); err == nil {
+			derived = netip.AddrFrom16(a16)
+		}
+	}
 	switch {
+	case local6.IsValid() && local6 == derived:
+		v6Derived = true
 	case local6.IsValid():
 		if !local6.Is6() || local6.Is4In6() {
 			fail("ipv6_address %s is not IPv6", local6)
@@ -545,31 +851,62 @@ func ResolveWith(cfg Config, ro ResolveOptions) (*Resolved, error) {
 		UDPChecksum: udpMode,
 	}
 
-	// Routes.
+	// Addresses and routes. Explicit routes come first so that they
+	// replace an automatic route for the same prefix.
+	r.Addresses = append([]netip.Prefix{}, cfg.Interface.Addresses...)
+	if r.Shared != nil {
+		r.Addresses = append(r.Addresses, netip.PrefixFrom(r.Config.CLAT.IPv4Address, 32))
+	}
+	r.Addresses = dedupe(r.Addresses)
+	var auto []netconf.Route
 	if boolOr(cfg.Interface.AutoRoutes, true) {
 		for _, e := range table.Entries() {
 			switch e.Kind {
 			case addrmap.KindStatic:
-				r.Routes4 = append(r.Routes4, e.V4)
+				if r.Shared != nil && e.V6 == netip.PrefixFrom(shared6, 128) {
+					continue // both sides are local addresses
+				}
+				auto = append(auto, netconf.Route{Prefix: e.V4})
 				if !cfg.Prefix.IsValid() || !cfg.Prefix.Contains(e.V6.Addr()) {
-					r.Routes6 = append(r.Routes6, e.V6)
+					auto = append(auto, netconf.Route{Prefix: e.V6})
 				}
 			case addrmap.KindRFC6052:
-				r.Routes6 = append(r.Routes6, e.V6)
+				if r.Shared != nil {
+					continue // the PLAT is reached over the network
+				}
+				auto = append(auto, netconf.Route{Prefix: e.V6})
 			case addrmap.KindDynamicPool:
-				r.Routes4 = append(r.Routes4, e.V4)
+				auto = append(auto, netconf.Route{Prefix: e.V4})
 			}
 		}
-	}
-	for _, p := range cfg.Interface.Routes {
-		if p.Addr().Is4() {
-			r.Routes4 = append(r.Routes4, p.Masked())
-		} else {
-			r.Routes6 = append(r.Routes6, p.Masked())
+		if r.Shared != nil {
+			auto = append(auto, netconf.Route{Prefix: netip.PrefixFrom(netip.IPv4Unspecified(), 0)})
 		}
 	}
-	r.Routes4 = dedupe(r.Routes4)
-	r.Routes6 = dedupe(r.Routes6)
+	seen := map[netip.Prefix]bool{}
+	for _, rt := range cfg.Interface.Routes {
+		nr := rt.netconf()
+		if seen[nr.Prefix] {
+			continue
+		}
+		seen[nr.Prefix] = true
+		if nr.Prefix.Addr().Is4() {
+			r.Routes4 = append(r.Routes4, nr)
+		} else {
+			r.Routes6 = append(r.Routes6, nr)
+		}
+	}
+	for _, nr := range auto {
+		if seen[nr.Prefix] {
+			continue
+		}
+		seen[nr.Prefix] = true
+		if nr.Prefix.Addr().Is4() {
+			r.Routes4 = append(r.Routes4, nr)
+		} else {
+			r.Routes6 = append(r.Routes6, nr)
+		}
+	}
 
 	// Logging and HTTP.
 	switch strings.ToLower(cfg.Log.Level) {
