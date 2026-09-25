@@ -155,9 +155,19 @@ where only containers in the same pod can reach it.
 
 ```sh
 go build ./cmd/clatto
-podman build -t clatto .
 go test ./...
 test/e2e.sh        # real tun device in a throwaway network namespace (no root needed)
+```
+
+The image is built with [ko](https://ko.build) from `.ko.yaml`: the static
+binary on `gcr.io/distroless/static-debian12`, for `linux/amd64` and
+`linux/arm64`. CI pushes `ghcr.io/andreabedini/clatto`
+tagged `latest`, `main`, `sha-<commit>`, `v1.2.3`/`1.2` for version tags
+and `pr-N` for pull requests. Locally:
+
+```sh
+ko build --local ./cmd/clatto                                   # into the local daemon
+KO_DOCKER_REPO=ghcr.io/you/clatto VERSION=dev ko build --bare ./cmd/clatto
 ```
 
 ## License

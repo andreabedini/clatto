@@ -12,7 +12,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}
+  KO_DOCKER_REPO: ghcr.io/${{ github.repository }}
 
 jobs:
   build:
@@ -20,23 +20,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-qemu-action@v3
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Log in to ghcr.io
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+      - uses: actions/setup-go@v5
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          go-version-file: go.mod
+
+      # Logs in to ghcr.io with GITHUB_TOKEN on its own.
+      - uses: ko-build/setup-ko@v0.10
 
       - name: Compute image tags
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE }}
+          images: ${{ env.KO_DOCKER_REPO }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -46,15 +41,14 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Containerfile
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          PUSH: ${{ github.event_name != 'pull_request' }}
+        run: |
+          # metadata-action emits full references; ko wants bare tags.
+          tags=$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | sed 's/.*://' | paste -sd,)
+          ko build --bare --push="$PUSH" --tags "$tags" \
+            --image-label org.opencontainers.image.source="${{ github.server_url }}/${{ github.repository }}" \
+            --image-label org.opencontainers.image.revision="${{ github.sha }}" \
+            --image-label org.opencontainers.image.version="$VERSION" \
+            ./cmd/clatto

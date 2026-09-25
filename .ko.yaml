@@ -1,0 +1,19 @@
+# ko (https://ko.build) builds the image without a Dockerfile: a static
+# binary on a distroless base. The root variant is used because the
+# translator needs CAP_NET_ADMIN, which the pod grants to the container.
+#
+#   ko build --local ./cmd/clatto                       # into the local daemon
+#   KO_DOCKER_REPO=ghcr.io/andreabedini/clatto ko build --bare ./cmd/clatto
+defaultBaseImage: gcr.io/distroless/static-debian12:latest
+defaultPlatforms:
+  - linux/amd64
+  - linux/arm64
+builds:
+  - id: clatto
+    main: ./cmd/clatto
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Env.VERSION }}
