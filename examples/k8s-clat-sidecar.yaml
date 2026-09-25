@@ -6,6 +6,13 @@
 # restartPolicy: Always) so that it is up, with routes and rules in place,
 # before the application containers start: /readyz only answers once the
 # kernel is configured and packets are being translated.
+#
+# The kubelet sends httpGet probes from the node, so they reach the
+# listener on the pod IP but never one bound to the pod's loopback. The
+# listener therefore stays on the pod IP with http.admin off (the
+# default), so only read-only endpoints are exposed; restrict it further
+# with a NetworkPolicy. To bind it to 127.0.0.1 instead, probe with
+# exec: {command: [/ko-app/clatto, -probe, /readyz]}.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -42,13 +49,13 @@ spec:
             # Alternatively, without "auto": the pod IP from the Downward API.
             # - {name: CLATTO_CLAT_IPV6_ADDRESS, valueFrom: {fieldRef: {fieldPath: status.podIP}}}
             # - {name: CLATTO_CLAT_PORTS, value: "udp/61000-61099 tcp/61000-61099"}
-            - {name: CLATTO_HTTP_LISTEN, value: "127.0.0.1:6464"}
+            - {name: CLATTO_HTTP_LISTEN, value: ":6464"}
           startupProbe:
-            httpGet: {path: /readyz, port: 6464, host: 127.0.0.1}
+            httpGet: {path: /readyz, port: 6464}
             periodSeconds: 1
             failureThreshold: 30
           livenessProbe:
-            httpGet: {path: /healthz, port: 6464, host: 127.0.0.1}
+            httpGet: {path: /healthz, port: 6464}
           securityContext:
             capabilities:
               drop: [ALL]

@@ -29,6 +29,7 @@ or with a file:
 clatto -config /etc/clatto/config.yaml
 clatto -config /etc/clatto/config.yaml -check         # validate only
 clatto -config /etc/clatto/config.yaml -print-config  # effective YAML
+clatto -config /etc/clatto/config.yaml -probe /readyz  # exec probe against the running instance
 ```
 
 The process needs `CAP_NET_ADMIN` and `/dev/net/tun`. See
@@ -139,7 +140,11 @@ disables this) and through the API:
 it back. The file and environment are not merged into it. A later file
 change replaces it again. Since the listener is normally reachable on the
 pod IP, enable `http.admin` only with the listener bound to `127.0.0.1`,
-where only containers in the same pod can reach it.
+where only containers in the same pod can reach it. The kubelet sends
+`httpGet` probes from the node, though, so a loopback listener needs exec
+probes instead: `clatto -probe /readyz` requests the path from the
+configured listener and exits 0 on success, and the image has no shell or
+curl to do it otherwise.
 
 ## Metrics
 

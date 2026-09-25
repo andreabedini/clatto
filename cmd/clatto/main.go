@@ -7,9 +7,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -43,6 +47,7 @@ func run() int {
 		printConfig = flag.Bool("print-config", false, "print the effective configuration as YAML and exit")
 		showVersion = flag.Bool("version", false, "print the version and exit")
 		noWatch     = flag.Bool("no-watch", false, "do not reload when the configuration file changes")
+		probe       = flag.String("probe", "", "request this path (e.g. /readyz) from the admin listener of the configured instance and exit 0 on success; for exec probes")
 	)
 	flag.Parse()
 	if *showVersion {
@@ -76,6 +81,13 @@ func run() int {
 	if err != nil {
 		bootLog.Error("invalid configuration", "error", err)
 		return 2
+	}
+	if *probe != "" {
+		if resolved.HTTPListen == "" {
+			bootLog.Error("probe", "error", "the admin listener is off")
+			return 2
+		}
+		return runProbe(probeURL(resolved.HTTPListen, *probe))
 	}
 	if *check {
 		fmt.Println("configuration ok")
@@ -174,4 +186,39 @@ func run() int {
 		<-daemonErr
 	}
 	return exit
+}
+
+// probeURL turns the listen address into a URL a process in the same
+// network namespace can reach: an unspecified host becomes loopback.
+func probeURL(listen, path string) string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		host, port = listen, ""
+	}
+	switch host {
+	case "", "0.0.0.0", "::":
+		host = "127.0.0.1"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return "http://" + net.JoinHostPort(host, port) + path
+}
+
+// runProbe fetches url and returns 0 on a 2xx answer, 1 otherwise, printing
+// the outcome for the probe log.
+func runProbe(url string) int {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "probe:", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	fmt.Printf("%s %s: %s", url, resp.Status, body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 1
+	}
+	return 0
 }
